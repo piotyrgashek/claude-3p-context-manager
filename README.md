@@ -3,7 +3,7 @@
 A macOS launcher and watcher that gives local Claude 3P Cowork conversations a
 **131,072-token auto-compaction window** and **stream timeouts long enough for a
 slow local model to write large files**, without changing terminal Claude Code
-configuration or Ollama.
+configuration or Ollama. This tool can be used to finetune your Claude Desktop 3p instance to utilize proper context window sizes, etc. Untill ollama provides those settings alongside with spoofing onto anthropic models.  
 
 ## What it does
 
