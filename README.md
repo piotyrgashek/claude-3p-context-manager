@@ -5,12 +5,6 @@ A macOS launcher and watcher that gives local Claude 3P Cowork conversations a
 slow local model to write large files**, without changing terminal Claude Code
 configuration or Ollama.
 
-This is a backup of the working helper. Version 1 (October 7, 2026) managed the
-compaction window. Version 2 (October 17, 2026) adds the stream-timeout settings
-and upgrades version 1 installations in place. The installer and shell binding
-use the destination machine's home directory and `node` on `PATH`; no username,
-Homebrew prefix, or backend address needs editing.
-
 ## What it does
 
 The `ccd` command updates existing 3P conversation settings, starts a background
@@ -130,7 +124,7 @@ In Terminal, change to the copied package directory. Replace the example path
 with its actual location:
 
 ```zsh
-cd "/path/to/_Claude_3P_context_window_manager_install_guids"
+cd "/path/to/repo"
 zsh ./install.zsh
 ```
 
@@ -154,7 +148,7 @@ refuses to overwrite a running installed helper.
 
 ```zsh
 ccd stop
-cd "/path/to/_Claude_3P_context_window_manager_install_guids"
+cd "/path/to/repo"
 zsh ./install.zsh
 ccd
 ```
