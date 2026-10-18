@@ -125,6 +125,7 @@ place, because the fallback is only used after a stream fails.
 | `install.zsh` | Installs the helper and shell binding into `~/.local/bin` |
 | `claude-3p-context.test.cjs` | Optional isolated checks using Node's built-in test runner |
 | `stream-timeout-harness.cjs` | Optional offline reproduction of the silent-stream failures with Desktop's session environment, and check of the fix |
+| `proxy-benchmark.cjs` | Optional measurement of the delay and throughput cost of the keep-alive proxy |
 | `README.md` | This installation, usage and recovery guide |
 
 Copy this whole folder to the other Mac. Do not copy your existing Claude
@@ -363,6 +364,20 @@ the Mac is pointed at it, and the terminal CLI never sees `HTTP_PROXY`.
 - `CCD_PROXY_PORT` in the environment of `ccd` overrides the port, and `0`
   picks a free one. The tests use that; normal use needs no change.
 
+Performance: the proxy runs on the Mac between the CLI and Ollama.app's local
+gateway and never contacts the inference server itself. It forwards requests
+unchanged, so Ollama's prompt cache behaves as before, and its pings never reach
+Ollama or the model; the CLI discards them, so they use no tokens or context.
+Measured with `proxy-benchmark.cjs` on an Apple silicon Mac, it adds about 0.2 ms
+per request and 0.1–0.3 ms per streamed event, and relays about 110 MB/s. For
+comparison, the model this was tuned with took about 17 s to start answering a
+70k-token conversation and about 45 ms per output token, a few KB/s of events.
+The helper's settings check, which shares the proxy's thread, runs about every
+2 seconds and can delay a chunk by about 2–6 ms with 29 conversations. The costs
+of the proxy are reliability trade-offs rather than speed: a conversation's
+requests fail if the helper dies while that conversation still points at it, and
+a stalled model is abandoned after about 35 minutes instead of about 5.
+
 ## Logs and troubleshooting
 
 ```zsh
@@ -433,7 +448,8 @@ actual Desktop app or modify the installed helper. They exercise merge,
 restore, version 1 and 2 backup migration, proxy-setting release, the keep-alive
 proxy (ping placement, unchanged relaying, `CONNECT` tunnels, upstream
 cancellation, refusal of non-proxy requests), malformed JSON and backups, symlink
-handling, watcher behavior and installation. Spawned watchers use a random proxy
+handling, watcher behavior and installation, and run a quick pass of the proxy
+benchmark. Spawned watchers use a random proxy
 port, temporary processes are stopped and fixtures are removed afterward.
 
 The embedded-CLI context check is optional because its path changes with
@@ -520,6 +536,41 @@ timeout allows with pings at its default. Expected:
 ```text
 fix         SURVIVED 960s silence    ccd settings and keep-alive proxy [proxy sent 63 ping(s)]
 ```
+
+### Proxy benchmark
+
+`proxy-benchmark.cjs` measures what the keep-alive proxy costs. It sends the same
+requests to a local fake Anthropic endpoint directly and through a proxy started
+from the helper's own `startKeepAliveProxy` in a separate process, as the
+installed helper runs it. It then times the watcher's settings sweep on your
+conversations folder using only read operations. It does not contact the
+installed proxy, Claude, Ollama or a model, and changes no files, so it is safe
+while the helper runs. For clean numbers, run it while no Cowork turn is active:
+
+```zsh
+node ./proxy-benchmark.cjs
+```
+
+It takes about 15 seconds; `--quick` takes a few seconds with noisier numbers.
+Results on an Apple silicon Mac with Node.js 26.5.0 and 29 conversations:
+
+```text
+Measurement                              Direct       Through proxy  Difference
+Small request round trip, median         0.14 ms      0.35 ms        +0.21 ms
+Small request round trip, p95            0.26 ms      0.58 ms        +0.32 ms
+Request with an 800 KB body, median      0.42 ms      0.75 ms        +0.33 ms
+1.26 MB event burst, median throughput   117 MB/s     112 MB/s       -4%
+Delay per event at 22 events/s, median   0.21 ms      0.52 ms        +0.31 ms
+Delay per event at 22 events/s, p99      1.18 ms      5.92 ms        +4.74 ms
+
+Watcher sweep of 29 conversation(s), which pauses the proxy while it runs: median 1.86 ms, max 5.84 ms.
+```
+
+The 800 KB body is about the size of a request near the 131k-token window, and
+22 events per second is the local model's typical token rate. Individual runs
+vary by a few tenths of a millisecond; the p99 row varies most. If a
+future change pushes the per-event or per-request differences towards tens of
+milliseconds, investigate before relying on the proxy.
 
 ## Compatibility notes
 

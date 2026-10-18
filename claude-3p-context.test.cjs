@@ -11,6 +11,7 @@ const crypto = require('node:crypto');
 const script = path.join(__dirname, 'claude-3p-context.cjs');
 const installer = path.join(__dirname, 'install.zsh');
 const harness = path.join(__dirname, 'stream-timeout-harness.cjs');
+const benchmark = path.join(__dirname, 'proxy-benchmark.cjs');
 const http = require('node:http');
 const net = require('node:net');
 const {
@@ -453,6 +454,24 @@ test('shouldRunTheStreamTimeoutHarnessAgainstTheActualEmbeddedCli', {
   assert.match(result.stdout, /^control\s+SURVIVED/m);
   assert.match(result.stdout, /^fix\s+SURVIVED.*proxy sent [1-9]\d* ping/m);
   assert.match(result.stdout, /^OK: ccd settings and keep-alive proxy/m);
+});
+
+test('shouldMeasureProxyOverheadWithTheBenchmark', t => {
+  // Given
+  const f = fixture(t);
+  configureSession(f.files.root, f.session(), PERSISTENT_OVERRIDES);
+
+  // When
+  const result = cp.spawnSync(process.execPath, [benchmark, '--quick'], {
+    env: { ...process.env, HOME: f.home }, encoding: 'utf8', timeout: 60000,
+  });
+
+  // Then
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /^Small request round trip, median\s+[\d.]+ ms\s+[\d.]+ ms\s+[+-][\d.]+ ms$/m);
+  assert.match(result.stdout, /MB event burst, median throughput\s+\d+ MB\/s\s+\d+ MB\/s/);
+  assert.match(result.stdout, /^Watcher sweep of 1 conversation\(s\)/m);
 });
 
 test('shouldStartOnlyOneWatcherAndStopOnlyItsOwnProcess', async t => {
