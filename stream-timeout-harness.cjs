@@ -1,30 +1,35 @@
 #!/usr/bin/env node
 'use strict';
 
-// Offline reproduction of the Claude Desktop 3P "Your response above was cut off mid-stream" loop.
-// A fake Anthropic endpoint sends the first SSE events and then stays byte-silent, as Ollama does
-// while it generates a long tool call. The Desktop-embedded Claude Code CLI runs with Desktop's own
-// session environment (API_FORCE_IDLE_TIMEOUT=1, API_TIMEOUT_MS=900000) and an isolated config, so
-// nothing in ~/.claude, the Claude-3p profile or Ollama is read or changed.
+// Offline reproduction of the Claude Desktop 3P "Your response above was cut off mid-stream" loop and
+// "API Error: The operation timed out." failures. A fake Anthropic endpoint sends the first SSE events
+// and then stays byte-silent, as Ollama does while it generates a long tool call. The Desktop-embedded
+// Claude Code CLI runs with the session environment Desktop gives Cowork conversations, including the
+// local-agent entrypoint that makes the launch environment win over settings files, and an isolated
+// config, so nothing in ~/.claude, the Claude-3p profile or Ollama is read or changed.
 
 const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const cp = require('node:child_process');
-const { OVERRIDES, configureSession } = require('./claude-3p-context.cjs');
+const {
+  PERSISTENT_OVERRIDES, PING_INTERVAL_MS, proxyOverrides, configureSession, startKeepAliveProxy,
+} = require('./claude-3p-context.cjs');
 
 const SCENARIOS = {
-  control: { about: 'Desktop defaults, silent gateway', pings: false, env: undefined },
-  fix: { about: 'settings written by ccd, silent gateway', pings: false, env: 'ccd' },
-  ping: { about: 'Desktop defaults, gateway sends SSE pings', pings: true, env: undefined },
-  streamonly: {
-    about: 'only CLAUDE_STREAM_IDLE_TIMEOUT_MS (Desktop "Stream idle timeout"), silent gateway',
-    pings: false,
-    env: { CLAUDE_STREAM_IDLE_TIMEOUT_MS: OVERRIDES.CLAUDE_STREAM_IDLE_TIMEOUT_MS },
-  },
+  control: { about: 'Desktop defaults', ccd: false, proxy: false },
+  noproxy: { about: 'ccd settings without the keep-alive proxy', ccd: true, proxy: false },
+  fix: { about: 'ccd settings and keep-alive proxy', ccd: true, proxy: true },
 };
-const DESKTOP_ENV = { API_FORCE_IDLE_TIMEOUT: '1', API_TIMEOUT_MS: '900000' };
+// What Desktop sets for every Cowork CLI that matters here (see the README).
+const DESKTOP_ENV = {
+  API_FORCE_IDLE_TIMEOUT: '1',
+  API_TIMEOUT_MS: '900000',
+  CLAUDE_CODE_ENTRYPOINT: 'local-agent',
+  CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
+  CLAUDE_CODE_HOST_AUTH_ENV_VAR: 'ANTHROPIC_AUTH_TOKEN',
+};
 const MARKER = 'SURVIVED_SILENCE';
 const EXIT_GRACE_MS = 60000;
 
@@ -32,16 +37,16 @@ const USAGE = `Usage: node stream-timeout-harness.cjs [options]
 
   --cli PATH              Desktop-embedded Claude Code CLI (default: $CLAUDE_3P_TEST_CLI or newest
                           ~/Library/Application Support/Claude-3p/claude-code/*/*/claude.app/Contents/MacOS/claude)
-  --silence-seconds N     Byte-silent gap after the first SSE events (default: 380)
-  --ping-seconds N        Keep-alive ping interval for the "ping" scenario (default: 15)
+  --silence-seconds N     Byte-silent gap after the first SSE events (default: 420)
+  --ping-seconds N        Keep-alive proxy ping interval (default: ${PING_INTERVAL_MS / 1000}, as installed)
   --scenarios LIST        Comma-separated subset of: ${Object.keys(SCENARIOS).join(', ')} (default: all)
   --keep                  Keep the temporary directory with configs and CLI diagnostics`;
 
 function parseArgs(argv) {
   const options = {
     cli: process.env.CLAUDE_3P_TEST_CLI,
-    silenceSeconds: 380,
-    pingSeconds: 15,
+    silenceSeconds: 420,
+    pingSeconds: PING_INTERVAL_MS / 1000,
     scenarios: Object.keys(SCENARIOS),
     keep: false,
     help: false,
@@ -102,7 +107,7 @@ function findEmbeddedCli() {
   return candidates[0]?.file;
 }
 
-function startFakeGateway(silenceMs, pingMs) {
+function startFakeGateway(silenceMs) {
   let resolveOutcome;
   const outcome = new Promise(resolve => { resolveOutcome = resolve; });
   let firstStreamSeen = false;
@@ -137,9 +142,7 @@ function startFakeGateway(silenceMs, pingMs) {
       send('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
       send('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'STREAM_' } });
 
-      const pinger = pingMs ? setInterval(() => send('ping', { type: 'ping' }), pingMs) : undefined;
       const timer = setTimeout(() => {
-        clearInterval(pinger);
         if (res.destroyed) return;
         finished = true;
         send('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: MARKER } });
@@ -152,7 +155,6 @@ function startFakeGateway(silenceMs, pingMs) {
         resolveOutcome({ completed: true, seconds: (Date.now() - started) / 1000 });
       }, silenceMs);
       res.on('close', () => {
-        clearInterval(pinger);
         clearTimeout(timer);
         if (!finished) resolveOutcome({ completed: false, seconds: (Date.now() - started) / 1000 });
       });
@@ -164,18 +166,18 @@ function startFakeGateway(silenceMs, pingMs) {
   });
 }
 
-function prepareConfig(dir, scenario) {
-  if (scenario.env === 'ccd') {
+function prepareConfig(dir, scenario, proxyPort) {
+  if (scenario.ccd) {
     // Use the helper's own merge so the check covers exactly what ccd writes.
     const root = path.join(dir, 'sessions');
     const config = path.join(root, '11111111', '22222222', '33333333', '.claude');
     fs.mkdirSync(config, { recursive: true });
-    configureSession(root, config);
+    configureSession(root, config, { ...PERSISTENT_OVERRIDES, ...(scenario.proxy ? proxyOverrides(proxyPort) : {}) });
     return config;
   }
   const config = path.join(dir, 'config');
   fs.mkdirSync(config, { recursive: true });
-  fs.writeFileSync(path.join(config, 'settings.json'), `${JSON.stringify(scenario.env ? { env: scenario.env } : {}, null, 2)}\n`);
+  fs.writeFileSync(path.join(config, 'settings.json'), '{}\n');
   return config;
 }
 
@@ -204,9 +206,12 @@ async function runScenario(name, options, workRoot, children) {
   const tmp = path.join(dir, 'tmp');
   const cwd = path.join(dir, 'work');
   [home, tmp, cwd].forEach(folder => fs.mkdirSync(folder, { recursive: true }));
-  const config = prepareConfig(dir, scenario);
+  const proxy = scenario.proxy
+    ? await startKeepAliveProxy({ port: 0, pingIntervalMs: options.pingSeconds * 1000 })
+    : undefined;
+  const config = prepareConfig(dir, scenario, proxy?.port);
   const diagnostics = path.join(dir, 'cli-diagnostics.jsonl');
-  const gateway = await startFakeGateway(options.silenceSeconds * 1000, scenario.pings ? options.pingSeconds * 1000 : 0);
+  const gateway = await startFakeGateway(options.silenceSeconds * 1000);
 
   const env = {
     HOME: home,
@@ -214,7 +219,7 @@ async function runScenario(name, options, workRoot, children) {
     TMPDIR: `${tmp}/`,
     CLAUDE_CONFIG_DIR: config,
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${gateway.port}`,
-    ANTHROPIC_API_KEY: 'sk-ant-offline-harness',
+    ANTHROPIC_AUTH_TOKEN: 'offline-harness',
     CLAUDE_CODE_DIAGNOSTICS_FILE: diagnostics,
     DISABLE_AUTOUPDATER: '1',
     DISABLE_TELEMETRY: '1',
@@ -266,8 +271,10 @@ async function runScenario(name, options, workRoot, children) {
     children.delete(child);
     gateway.server.closeAllConnections();
     gateway.server.close();
+    await proxy?.close();
   }
-  return { name, scenario, ...verdict, notes: diagnosticsSummary(diagnostics) };
+  const notes = [proxy ? `proxy sent ${proxy.stats.pings} ping(s)` : '', diagnosticsSummary(diagnostics)];
+  return { name, scenario, ...verdict, notes: notes.filter(Boolean).join('; ') };
 }
 
 async function main() {
@@ -303,16 +310,18 @@ async function main() {
       console.log(`${name.padEnd(11)} ${result.padEnd(24)} ${scenario.about}${extra ? ` [${extra}]` : ''}`);
     }
     console.log('');
-    const fix = results.find(entry => entry.name === 'fix');
-    const control = results.find(entry => entry.name === 'control');
-    if (control?.survived && options.silenceSeconds > 300) {
-      console.log('Note: Desktop defaults also survived; this Desktop build may no longer need the stream-timeout overrides.');
+    const byName = Object.fromEntries(results.map(entry => [entry.name, entry]));
+    if (byName.control?.survived && options.silenceSeconds > 300) {
+      console.log('Note: Desktop defaults also survived; this Desktop build may no longer need the keep-alive proxy.');
     }
-    if (fix && !fix.survived) {
-      console.log('FAIL: the settings written by ccd did not keep the silent stream alive with this CLI build.');
+    if (byName.noproxy?.survived && options.silenceSeconds > 360) {
+      console.log('Note: settings alone survived; Desktop may no longer force API_FORCE_IDLE_TIMEOUT=1.');
+    }
+    if (byName.fix && !byName.fix.survived) {
+      console.log('FAIL: ccd settings and keep-alive proxy did not keep the silent stream alive with this CLI build.');
       process.exitCode = 1;
-    } else if (fix) {
-      console.log('OK: the settings written by ccd keep a byte-silent stream alive with this CLI build.');
+    } else if (byName.fix) {
+      console.log('OK: ccd settings and keep-alive proxy keep a byte-silent stream alive with this CLI build.');
     }
     if (options.keep) console.log(`Kept: ${workRoot}`);
   } finally {

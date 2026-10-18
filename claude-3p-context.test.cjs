@@ -11,8 +11,15 @@ const crypto = require('node:crypto');
 const script = path.join(__dirname, 'claude-3p-context.cjs');
 const installer = path.join(__dirname, 'install.zsh');
 const harness = path.join(__dirname, 'stream-timeout-harness.cjs');
-const { OVERRIDES, locations, configureSession, restoreSession, scan, startWatching } = require(script);
+const http = require('node:http');
+const net = require('node:net');
+const {
+  OVERRIDES, PERSISTENT_OVERRIDES, RETIRED_KEYS, proxyOverrides, locations, configureSession, restoreSession,
+  releaseProxySession, scan, startWatching, startKeepAliveProxy,
+} = require(script);
 const cli = process.env.CLAUDE_3P_TEST_CLI;
+// Spawned watchers must not take the real helper's proxy port.
+const watcherEnv = home => ({ ...process.env, HOME: home, CCD_PROXY_PORT: '0' });
 
 function fixture(t) {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ccd-test-')));
@@ -142,18 +149,103 @@ test('shouldExtendALegacyBackupWithNewlyManagedKeysAndRestoreThem', t => {
 
   // Then
   assert.equal(changed, true);
-  assert.deepEqual(configured, { model: 'keep', env: { KEEP: 'yes', ...OVERRIDES } });
+  assert.deepEqual(configured, { model: 'keep', env: { KEEP: 'yes', API_TIMEOUT_MS: '600000', ...OVERRIDES } });
   assert.deepEqual(backup.applied, { ...OVERRIDES });
   assert.deepEqual(backup.original.CLAUDE_CODE_AUTO_COMPACT_WINDOW, { present: true, value: '200000' });
-  assert.deepEqual(backup.original.API_TIMEOUT_MS, { present: true, value: '600000' });
-  assert.deepEqual(backup.original.API_FORCE_IDLE_TIMEOUT, { present: false });
   assert.deepEqual(backup.original.CLAUDE_STREAM_IDLE_TIMEOUT_MS, { present: false });
+  assert.deepEqual(backup.original.HTTP_PROXY, { present: false });
+  assert.equal(Object.hasOwn(backup.original, 'API_TIMEOUT_MS'), false);
   assert.equal(restored, true);
   assert.deepEqual(read(file), {
     model: 'keep',
     env: { KEEP: 'yes', API_TIMEOUT_MS: '600000', CLAUDE_CODE_AUTO_COMPACT_WINDOW: '200000' },
   });
   assert.equal(fs.existsSync(backupFile), false);
+});
+
+test('shouldRetireVersionTwoTimeoutKeysAndRestoreTheirOriginals', t => {
+  // Given
+  const f = fixture(t);
+  const dir = f.session();
+  const file = path.join(dir, 'settings.json');
+  const backupFile = path.join(dir, '.ccd-context-backup.json');
+  const version2 = {
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW: '131072',
+    CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '85',
+    API_FORCE_IDLE_TIMEOUT: '0',
+    CLAUDE_STREAM_IDLE_TIMEOUT_MS: '1800000',
+    API_TIMEOUT_MS: '2400000',
+  };
+  write(file, { env: { KEEP: 'yes', ...version2 } });
+  write(backupFile, {
+    version: 1,
+    settingsExisted: true,
+    envExisted: true,
+    original: {
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: { present: false },
+      CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: { present: false },
+      API_FORCE_IDLE_TIMEOUT: { present: false },
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS: { present: false },
+      API_TIMEOUT_MS: { present: true, value: '600000' },
+    },
+    applied: version2,
+  });
+
+  // When
+  const changed = configureSession(f.files.root, dir);
+  const configured = read(file);
+  const backup = read(backupFile);
+  restoreSession(f.files.root, dir);
+
+  // Then
+  assert.equal(changed, true);
+  assert.deepEqual(configured, { env: { KEEP: 'yes', API_TIMEOUT_MS: '600000', ...OVERRIDES } });
+  assert.deepEqual(Object.keys(backup.applied).sort(), Object.keys(OVERRIDES).sort());
+  assert.deepEqual(Object.keys(backup.original).sort(), Object.keys(OVERRIDES).sort());
+  RETIRED_KEYS.forEach(key => assert.equal(Object.hasOwn(backup.applied, key), false));
+  assert.deepEqual(read(file), { env: { KEEP: 'yes', API_TIMEOUT_MS: '600000' } });
+  assert.equal(fs.existsSync(backupFile), false);
+});
+
+test('shouldReleaseOnlyTheProxySettingAndKeepTheOthers', t => {
+  // Given
+  const f = fixture(t);
+  const dir = f.session();
+  const file = path.join(dir, 'settings.json');
+  const backupFile = path.join(dir, '.ccd-context-backup.json');
+  write(file, { env: { HTTP_PROXY: 'http://user-proxy.example:3128', KEEP: 'yes' } });
+  configureSession(f.files.root, dir);
+
+  // When
+  const released = releaseProxySession(f.files.root, dir);
+  const repeated = releaseProxySession(f.files.root, dir);
+
+  // Then
+  assert.equal(released, true);
+  assert.equal(repeated, false);
+  assert.deepEqual(read(file), { env: { HTTP_PROXY: 'http://user-proxy.example:3128', KEEP: 'yes', ...PERSISTENT_OVERRIDES } });
+  assert.deepEqual(read(backupFile).applied, { ...PERSISTENT_OVERRIDES });
+  assert.equal(Object.hasOwn(read(backupFile).original, 'HTTP_PROXY'), false);
+  restoreSession(f.files.root, dir);
+  assert.deepEqual(read(file), { env: { HTTP_PROXY: 'http://user-proxy.example:3128', KEEP: 'yes' } });
+});
+
+test('shouldFollowAProxyPortChangeAndStillRestoreTheOriginal', t => {
+  // Given
+  const f = fixture(t);
+  const dir = f.session();
+  const file = path.join(dir, 'settings.json');
+  configureSession(f.files.root, dir, { ...PERSISTENT_OVERRIDES, ...proxyOverrides(40001) });
+
+  // When
+  const changed = configureSession(f.files.root, dir, { ...PERSISTENT_OVERRIDES, ...proxyOverrides(40002) });
+  const configured = read(file);
+  restoreSession(f.files.root, dir);
+
+  // Then
+  assert.equal(changed, true);
+  assert.equal(configured.env.HTTP_PROXY, 'http://127.0.0.1:40002');
+  assert.equal(fs.existsSync(file), false);
 });
 
 test('shouldRestoreOnlyTheKeysRecordedInALegacyBackup', t => {
@@ -315,7 +407,7 @@ test('shouldShowTheSmallerWindowInTheActualEmbeddedCli', {
   // Given
   const f = fixture(t);
   const dir = f.session();
-  configureSession(f.files.root, dir);
+  configureSession(f.files.root, dir, PERSISTENT_OVERRIDES);
   const env = {
     ...process.env,
     HOME: f.home,
@@ -350,7 +442,7 @@ test('shouldRunTheStreamTimeoutHarnessAgainstTheActualEmbeddedCli', {
   skip: cli ? false : 'Set CLAUDE_3P_TEST_CLI to the Desktop embedded CLI to run this offline probe.',
 }, () => {
   // Given
-  const args = [harness, '--cli', cli, '--silence-seconds', '3', '--scenarios', 'control,fix'];
+  const args = [harness, '--cli', cli, '--silence-seconds', '3', '--ping-seconds', '1', '--scenarios', 'control,fix'];
 
   // When
   const result = cp.spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 90000 });
@@ -359,40 +451,189 @@ test('shouldRunTheStreamTimeoutHarnessAgainstTheActualEmbeddedCli', {
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /^control\s+SURVIVED/m);
-  assert.match(result.stdout, /^fix\s+SURVIVED/m);
-  assert.match(result.stdout, /^OK: the settings written by ccd/m);
+  assert.match(result.stdout, /^fix\s+SURVIVED.*proxy sent [1-9]\d* ping/m);
+  assert.match(result.stdout, /^OK: ccd settings and keep-alive proxy/m);
 });
 
 test('shouldStartOnlyOneWatcherAndStopOnlyItsOwnProcess', async t => {
   // Given
   const f = fixture(t);
+  const dir = f.session();
+  const file = path.join(dir, 'settings.json');
   const token = crypto.randomBytes(16).toString('hex');
-  const env = { ...process.env, HOME: f.home };
+  const env = watcherEnv(f.home);
+  const target = http.createServer((req, res) => res.end(`reached ${req.url}`));
+  await new Promise(resolve => target.listen(0, '127.0.0.1', resolve));
+  t.after(() => target.close());
   const child = cp.spawn(process.execPath, [script, 'watch', token], { env, stdio: 'ignore' });
   const exited = new Promise(resolve => child.once('exit', resolve));
   try {
     await waitFor(() => fs.existsSync(f.files.pid) && read(f.files.pid).ready === true);
+    const proxyPort = read(f.files.pid).proxyPort;
+    const routed = await new Promise((resolve, reject) => {
+      http.get({ host: '127.0.0.1', port: proxyPort, path: `http://127.0.0.1:${target.address().port}/probe` }, res => {
+        let body = '';
+        res.on('data', chunk => { body += chunk; });
+        res.on('end', () => resolve(body));
+      }).on('error', reject);
+    });
 
     // When
     const duplicate = cp.spawnSync(process.execPath, [script, 'watch', crypto.randomBytes(16).toString('hex')], {
       env, encoding: 'utf8', timeout: 5000,
     });
     const status = cp.spawnSync(process.execPath, [script, 'status'], { env, encoding: 'utf8', timeout: 5000 });
+    const configured = read(file);
     const stop = cp.spawnSync(process.execPath, [script, 'stop'], { env, encoding: 'utf8', timeout: 10000 });
 
     // Then
+    assert.equal(routed, 'reached /probe');
     assert.equal(duplicate.status, 0, duplicate.stderr);
     assert.equal(status.status, 0, status.stderr);
-    assert.match(status.stdout, new RegExp(`PID ${child.pid}; window=131072; stream idle timeout=1800s`));
+    assert.match(status.stdout, new RegExp(`PID ${child.pid}; window=131072; stream idle timeout=1800s; ` +
+      `keep-alive proxy=http://127\\.0\\.0\\.1:${proxyPort}`));
+    assert.deepEqual(configured, { env: { ...PERSISTENT_OVERRIDES, ...proxyOverrides(proxyPort) } });
     assert.equal(stop.status, 0, stop.stderr);
     await exited;
     assert.equal(fs.existsSync(f.files.pid), false);
+    assert.deepEqual(read(file), { env: { ...PERSISTENT_OVERRIDES } });
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM');
       await exited;
     }
   }
+});
+
+test('shouldRemoveAStaleProxySettingWhenTheProxyCannotStart', async t => {
+  // Given
+  const f = fixture(t);
+  const dir = f.session();
+  const file = path.join(dir, 'settings.json');
+  const busy = net.createServer();
+  await new Promise(resolve => busy.listen(0, '127.0.0.1', resolve));
+  t.after(() => busy.close());
+  configureSession(f.files.root, dir, { ...PERSISTENT_OVERRIDES, ...proxyOverrides(busy.address().port) });
+  const env = { ...watcherEnv(f.home), CCD_PROXY_PORT: String(busy.address().port) };
+  const warning = cp.spawnSync(process.execPath, [script, 'status'], { env, encoding: 'utf8', timeout: 5000 });
+
+  // When
+  const result = cp.spawnSync(process.execPath, [script, 'watch', crypto.randomBytes(16).toString('hex')], {
+    env, encoding: 'utf8', timeout: 10000,
+  });
+
+  // Then
+  assert.match(warning.stdout, /1 conversation\(s\) still route through the stopped keep-alive proxy/);
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /keep-alive proxy could not start/);
+  assert.match(result.stdout, /Removed the keep-alive proxy from 1 conversation\(s\)/);
+  assert.deepEqual(read(file), { env: { ...PERSISTENT_OVERRIDES } });
+  assert.equal(fs.existsSync(f.files.pid), false);
+});
+
+test('shouldPingSilentEventStreamsOnlyBetweenEvents', async t => {
+  // Given
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const upstream = http.createServer(async (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: first\ndata: 1\n\n');
+    await pause(300);
+    res.write('event: second\ndata: ');
+    await pause(300);
+    res.write('2\n\n');
+    await pause(300);
+    res.end('event: last\ndata: 3\n\n');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = await startKeepAliveProxy({ port: 0, pingIntervalMs: 50 });
+  t.after(async () => { await proxy.close(); upstream.close(); });
+
+  // When
+  const body = await new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port: proxy.port, path: `http://127.0.0.1:${upstream.address().port}/v1/messages` }, res => {
+      let text = '';
+      res.on('data', chunk => { text += chunk; });
+      res.on('end', () => resolve(text));
+    }).on('error', reject);
+  });
+
+  // Then
+  const ping = 'event: ping\ndata: {"type": "ping"}\n\n';
+  assert.ok(proxy.stats.pings >= 4, `expected pings, got ${proxy.stats.pings}`);
+  assert.equal(body.split(ping).join(''), 'event: first\ndata: 1\n\nevent: second\ndata: 2\n\nevent: last\ndata: 3\n\n');
+  assert.match(body, /^event: first\ndata: 1\n\n(event: ping\ndata: \{"type": "ping"\}\n\n)+event: second\ndata: 2\n\n/);
+});
+
+test('shouldRelayOtherResponsesUnchangedAndRejectNonProxyRequests', async t => {
+  // Given
+  const upstream = http.createServer((req, res) => {
+    setTimeout(() => res.writeHead(201, { 'content-type': 'application/json' }).end('{"ok":true}'), 200);
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = await startKeepAliveProxy({ port: 0, pingIntervalMs: 20 });
+  t.after(async () => { await proxy.close(); upstream.close(); });
+  const get = requestPath => new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port: proxy.port, path: requestPath }, res => {
+      let text = '';
+      res.on('data', chunk => { text += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, text }));
+    }).on('error', reject);
+  });
+
+  // When
+  const relayed = await get(`http://127.0.0.1:${upstream.address().port}/json`);
+  const direct = await get('/not-a-proxy-request');
+
+  // Then
+  assert.deepEqual(relayed, { status: 201, text: '{"ok":true}' });
+  assert.equal(direct.status, 400);
+  assert.equal(proxy.stats.pings, 0);
+});
+
+test('shouldTunnelConnectRequestsAndCancelUpstreamWhenTheClientLeaves', async t => {
+  // Given
+  const echo = net.createServer(socket => socket.pipe(socket));
+  await new Promise(resolve => echo.listen(0, '127.0.0.1', resolve));
+  let upstreamClosed;
+  const closed = new Promise(resolve => { upstreamClosed = resolve; });
+  const stream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: start\ndata: 0\n\n');
+    res.on('close', upstreamClosed);
+  });
+  await new Promise(resolve => stream.listen(0, '127.0.0.1', resolve));
+  const proxy = await startKeepAliveProxy({ port: 0, pingIntervalMs: 50 });
+  t.after(async () => { await proxy.close(); echo.close(); stream.close(); });
+
+  // When
+  const echoed = await new Promise((resolve, reject) => {
+    const socket = net.connect(proxy.port, '127.0.0.1', () => {
+      socket.write(`CONNECT 127.0.0.1:${echo.address().port} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`);
+    });
+    let text = '';
+    socket.on('data', chunk => {
+      text += chunk;
+      if (text.endsWith('\r\n\r\n') && !text.includes('hello')) socket.write('hello');
+      if (text.endsWith('hello')) {
+        socket.end();
+        resolve(text);
+      }
+    });
+    socket.on('error', reject);
+  });
+  await new Promise((resolve, reject) => {
+    const req = http.get({ host: '127.0.0.1', port: proxy.port, path: `http://127.0.0.1:${stream.address().port}/v1/messages` }, res => {
+      res.once('data', () => {
+        req.destroy();
+        resolve();
+      });
+    });
+    req.on('error', error => { if (error.code !== 'ECONNRESET') reject(error); });
+  });
+
+  // Then
+  assert.match(echoed, /^HTTP\/1\.1 200 Connection Established\r\n\r\nhello$/);
+  await closed;
 });
 
 test('shouldInstallPortablyWithoutEditingSettingsOrStartingClaude', t => {
@@ -471,7 +712,7 @@ test('shouldRefuseToOverwriteARunningInstalledHelper', async t => {
   const f = fixture(t);
   assert.equal(install(f).status, 0);
   const installed = path.join(f.home, '.local/bin/claude-3p-context.cjs');
-  const env = { ...process.env, HOME: f.home };
+  const env = watcherEnv(f.home);
   const child = cp.spawn(process.execPath, [installed, 'watch', crypto.randomBytes(16).toString('hex')], {
     env, stdio: 'ignore',
   });
