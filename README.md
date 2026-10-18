@@ -5,6 +5,14 @@ A macOS launcher and watcher that gives local Claude 3P Cowork conversations a
 alive long enough to write large files**, without changing terminal Claude Code
 configuration or Ollama.
 
+## Starting and stopping
+
+- `ccd` starts the helper and its proxy, then opens Claude 3P. Always launch Desktop this way rather than from Finder or Ollama.
+- `ccd status` shows whether it's running.
+- `ccd stop`: quit Claude with Cmd-Q first, then run it. It stops the helper and proxy and removes the proxy setting from your Desktop chats; the compaction settings stay.
+- `ccd restore` undoes all of its changes.
+- The helper also stops by itself about a minute after you quit Claude 3P.
+
 ## What it does
 
 The `ccd` command updates existing 3P conversation settings, starts a background
